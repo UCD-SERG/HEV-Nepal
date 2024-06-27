@@ -1,0 +1,898 @@
+---
+title: "HEV paper Tables and Figures"
+output: html_document
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0(substr(inputFile,1,nchar(inputFile)-4),Sys.Date(),'.html')) })
+author: "Nishan Katuwal & Kristen Aiemjoy"
+date: '`r paste("Updated on", Sys.Date())`'
+---
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#load packages
+
+library(tidyverse) 
+library(lubridate)
+library(mixtools)
+library(ggbeeswarm)
+library(table1)
+library(ggsci)
+library(scales)
+library(cowplot)
+library(doParallel)
+library(mgcv)
+library(ggmap)
+library(emmeans)
+library(lme4)
+library(kableExtra)
+library(gridExtra)
+library(ggExtra)
+
+pal.pos <- c("#00798c", "#d1495b")
+
+
+#load data
+d0 <- readRDS("data/hev_serology_nepal_062724.rds")
+
+
+## Find cutoff
+##Reference: Arnold, Benjamin F., et al. "Enteropathogen antibody dynamics and force of infection among children in low-resource settings." Elife 8 (2019): e45594.
+#Pull density curves from mixture model fit (for plotting)
+fitmix2 <- function(x,lambda,k) {
+  mixfit <- normalmixEM(x,lambda=lambda,k=k)
+  mixcut <- mixfit$mu[order(mixfit$mu)][1]+3.5*mixfit$sigma[order(mixfit$mu)][1]
+  list(mixcut=mixcut,mixfit=mixfit)
+  # pull out fitted densities
+  denmat <- matrix(NA,nrow=length(x),ncol=k)
+  for(i in 1:k) {
+    denmat[,i] <- mixfit$lambda[i] * dnorm(x,mean=mixfit$mu[i],sd=mixfit$sigma[i])
+  }
+  denmat <- data.frame(denmat)
+  colnames(denmat) <- paste("den",1:k,sep="")
+  # return original values plus fitted densities in a dataframe 
+  # also return the cutoff value and normalmixEM object
+  xden <- data.frame(x=x,denmat)
+  list(xden=xden,mixcut=mixcut,mixfit=mixfit)
+}
+
+
+#model fit
+mixfit <- fitmix2(x=d0$hevlog,lambda=1,k=2)
+
+#densities for plotting
+mixdens <- data.frame(mixfit$xden) %>%
+  pivot_longer(cols = c("den1", "den2")) %>%
+  mutate(name = factor(name, labels = c("density 1", "density 2")))
+
+#mixture cuttoff
+mixcut <- exp(mixfit$mixcut)
+
+mixcut2 <- 0.1869933
+mixcut3 <- 0.2759264
+mixcut4 <- 0.4071558
+
+
+
+#add cutoffs and generate seropositivity variable
+d0 <- d0 %>%
+  mutate(hev_pos=ifelse(hev_result>=mixcut,1,0)) %>%
+  #mutate(hev_pos=ifelse(hev_result>hev_bordeline_control*.7,1,0)) %>%
+  mutate(hev_pos_lab=factor(hev_pos, labels = c("Negative", "Positive"))) %>%
+  group_by(index_id) %>%
+  mutate(pos_any = sum(hev_pos)) %>%
+  ungroup () %>%
+  mutate(group.pos = ifelse(pos_any >= 1, index_id, 1:n()))
+
+## Baseline data
+d0_bs <- d0 %>% 
+  filter(TimePeriod == "Baseline")
+
+##breastfed kids <2
+bf <- d0_bs %>% filter(age<2)
+table(bf$dbs_breastfed)
+
+
+##last visit data
+d0_f <- d0 %>% 
+  mutate(visit_num = as.numeric(TimePeriod)) %>%
+  group_by(index_id) %>%
+  mutate(maxvisits = max(visit_num)) %>%
+  filter(visit_num == maxvisits) %>%
+   ungroup()
+
+
+
+### in text results
+#number of positive individuals
+d0 %>% 
+  select(index_id, pos_any) %>%
+  mutate(pos_ever = ifelse(pos_any >= 1, 1, 0)) %>%
+  distinct() %>%
+  summarise(npos = sum(pos_ever))
+
+
+```
+
+
+
+
+## Table 1: Demographic Characteristics of enrolled individuals
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+my.render.cont <- function(x) {
+  with(stats.apply.rounding(stats.default(x, ), digits = 2),
+       c("",
+         "Median (IQR)" = sprintf(paste("%s (",Q1,"- %s)"), MEDIAN, Q3, sep=""),
+          "Min/Max" = sprintf(paste0(MIN, " - ", MAX))))
+}
+
+
+
+label(d0_bs$age) <- "Age, in years"
+label(d0_bs$sex) <- "Gender"
+label(d0_bs$hf_famincome_nepal) <- "Monthly income, Nepalese rupees"
+label(d0_bs$watersource) <- "Primary water source"
+label(d0_bs$nvisits) <- "Number of study visits"
+label(d0_bs$hftreatdkwater) <- "Treat water before drinking"
+
+table1(~ age +  sex  +  nvisits + hf_famincome_nepal + watersource +   hftreatdkwater   |  areaunt2_nepal, data = d0_bs, render.continuous=my.render.cont)
+
+
+```
+
+
+
+## Figure 1: Identifying the cutoff value for ELISA optical density (OD) responses
+```{r echo=FALSE, fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+
+
+mixdens <- mixdens %>% mutate(hev_pos_lab = factor(name, levels = c("density 1", "density 2"), labels = c("Negative", "Positive")))
+
+rank <- d0_bs %>%
+  select(index_id, hev_result, hevlog,  hev_pos_lab) %>%
+  arrange(hev_result) %>%
+  ungroup()%>%
+  mutate(rank = seq(1:n()))
+
+
+
+# First plot
+linetypes_df <- data.frame(
+  xintercept = c(mixcut, mixcut2, mixcut3, mixcut4),
+  linetype = c("mean + 3.5SD", "mean + 2 SD", "mean + 3 SD", "mean + 4 SD"),
+  alpha = c(1, 0.5, 0.5, 0.5)
+)
+
+
+p1 <- ggplot(d0_bs, aes(x = hev_result, fill = hev_pos_lab)) +
+  geom_histogram(position = "identity", bins = 90, alpha = .7, show.legend = F) +
+  geom_vline(data = linetypes_df, aes(xintercept = xintercept, linetype = linetype, alpha = alpha), key_glyph = "path") +
+  scale_fill_manual(values = pal.pos) +
+  theme_linedraw() + 
+  scale_x_log10(breaks = c(0, .01, .1, .3, 1, 3), limits = c(0.01, 3.5)) + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + 
+  labs(x = " ", title = "A)") + 
+  scale_linetype_manual(name = "Mixture model cutoff",
+                        values = c("mean + 3.5SD" = "dashed",
+                                   "mean + 2 SD" = "twodash",
+                                   "mean + 3 SD" = "dotted",
+                                   "mean + 4 SD" = "dotdash")) +
+  scale_alpha(range = c(0.5, 1), guide = 'none')  
+
+#second plot
+
+
+negatives <- data.frame(Control = "Negative", result = d0$hev_neg_control, date=d0$dbsdate)
+positives  <- data.frame(Control = "Positive", result = d0$hev_pos_control, date=d0$dbsdate)
+border <- data.frame(Control = "Borderline", result = d0$hev_bordeline_control, date=d0$dbsdate)
+
+contr.comb <- rbind(negatives, positives, border) %>%
+  distinct() %>%
+  mutate(Control = factor(Control))
+
+
+p3 <- ggplot(contr.comb, aes(x = result, fill = Control)) +
+  geom_histogram(position="identity", bins=30, alpha = .7, show.legend = T) + 
+  geom_vline(xintercept = mixcut, linetype = "dashed") + 
+  scale_fill_manual(values = c( "mediumorchid4","#00798c", "#d1495b"), name = "Plate Control") +
+  theme_linedraw() + 
+  scale_x_log10(breaks = c(0,.01,.1, .3,  1, 3 ), limits = c(0.01, 3.5)) + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + 
+  labs(x="ELISA OD Value",  title = "B)") + 
+  theme(legend.justification = "center", legend.box.just = "center",legend.title = element_text(size = 12))
+
+
+
+p2 <- ggplot(rank, aes(x = hev_result, y = rank)) + 
+  geom_point(aes(color = hev_pos_lab), size = 1) + 
+  geom_segment(aes(x = mixcut, xend = mixcut, y = -Inf, yend = Inf), linetype = "dashed", color = "black") +
+  scale_color_manual(values = pal.pos, name = "HEV Seropositive") +
+ # scale_linetype_manual(values = c("mean + 3.5SD" = "dashed")) +
+  theme_linedraw() + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + 
+  labs(x="ELISA OD Value", linetype ="Mixture-model cutoff", y="Rank order", title = "C)") + 
+  theme(legend.justification = "center", legend.box.just = "center", legend.title = element_text(size = 12))
+
+
+
+
+# Function to extract the legend from a ggplot object
+get_legend <- function(plot) {
+  g <- ggplotGrob(plot)
+  legend <- g$grobs[[which(sapply(g$grobs, function(x) x$name) == "guide-box")]]
+  return(legend)
+}
+
+# Extract legends from p2, and p3
+legend1 <- get_legend(p1)
+legend2 <- get_legend(p2)
+legend3 <- get_legend(p3)
+
+# Combine the legends
+combined_legend <- plot_grid(legend1, legend2, legend3, ncol = 1)
+
+# Remove legends from the original plots
+p1 <- p1 + theme(legend.position = "none")
+p2 <- p2 + theme(legend.position = "none")
+p3 <- p3 + theme(legend.position = "none")
+
+# Create the layout matrix
+layout_matrix <- rbind(
+  c(1, 2),
+  c(3, 2)
+)
+
+# Arrange the plots with the combined legend
+fig1 <- grid.arrange(
+  arrangeGrob(p1, p2, p3, layout_matrix = layout_matrix),
+  combined_legend,
+  ncol = 2,
+  widths = c(3, 1)  # Adjust widths as needed
+)
+
+fig1
+
+```
+
+
+## Figure 2: Quantiative antibody responses by date and study site location
+```{r echo=FALSE, fig.height=13, fig.width=12, message=FALSE, warning=FALSE}
+
+
+# Define the single sampling period
+
+sampling_periods <- data.frame(
+  start = as.Date(c("2020-03-22", "2020-08-13", "2020-10-04")),  # Replace with your actual start dates
+  end = as.Date(c("2020-07-08", "2020-09-14", "2020-11-08"))     # Replace with your actual end dates
+)
+
+# Get the y-axis range from the data
+y_range <- range(d0$hev_result, na.rm = TRUE)
+
+ggplot(data=d0, aes(x=dbsdate, y = hev_result)) + 
+  geom_rect(data = sampling_periods, 
+            aes(xmin = start, xmax = end, ymin = y_range[1], ymax = y_range[2]), 
+            fill = "grey", alpha = 0.6, inherit.aes = FALSE) +  # Adjust alpha for transparency
+  geom_line(aes(group = group.pos), alpha = .5, color = "black") + 
+  geom_point(size = 1, alpha = .9, aes(color = as.factor(hev_pos_lab))) + 
+  scale_x_date(date_breaks  ="4 month", labels = date_format("%b %Y"), minor_breaks = NULL) +
+  scale_y_log10() +
+  theme_linedraw() +
+  geom_hline(aes(yintercept = mixcut, linetype = "Mixture model cutoff")) + 
+  labs(x = "Sample collection date", y = " ") +
+  facet_wrap(~areaunt2_nepal, ncol = 1) + 
+  scale_color_manual(values = pal.pos) +
+  theme(
+    legend.title = element_blank(),
+    plot.margin=unit(c(1,1,1,-.5), "cm")
+  ) + 
+  scale_linetype_manual(values = c("dashed"), name="")
+
+
+```
+
+
+## Table 2: HEV Seroprevalence at baseline visit
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+
+overall <- d0_bs %>%
+    summarise(n = n(),
+              nPos = sum(hev_pos),
+              crudPrev = paste0(sprintf('%.1f', (nPos / n)*100), "%"))  %>%
+  mutate(Est = "-",
+         Pval = "-",
+         variable = "Overall", 
+         levels = "Overall") %>%
+  select(variable, levels, n, nPos, crudPrev, Est, Pval) 
+
+
+varnames <- c("ageCat")
+
+table2A <- data.frame()  
+
+for (i in varnames){
+  formula    <- as.formula(paste0( "hev_pos ~ ", i ))
+  
+  fit <- glm(formula, data = d0_bs, family = binomial(link=logit))
+
+  res <- as.data.frame(emmeans(fit, i, type="response")) %>%
+    mutate(Est = paste(sprintf('%.1f', prob*100), "% (",  sprintf('%.1f', asymp.LCL*100), "-", sprintf('%.1f', asymp.UCL*100), ")", sep="")) %>%
+    mutate(variable = i) %>%
+    rename(levels = i) %>%
+    select(variable, levels, Est) %>%
+    mutate(Pval = sprintf('%.3f', summary(fit)$coefficients[,4]))
+  
+  res[1,4] <- "-"
+  
+    # group d0_bs by i and calculate n, nPos, and prevalence
+  summary_info <- d0_bs %>%
+    group_by_at(vars(i)) %>%
+    summarise(n = n(),
+              nPos = sum(hev_pos),
+              prevalence = paste0(sprintf('%.1f', (nPos / n)*100), "%")) %>% 
+  na.omit()
+  
+  # add summary information to res table
+  res$n <- summary_info$n
+  res$nPos <- summary_info$nPos
+  res$crudPrev <- summary_info$prevalence
+    
+  table2A <- rbind(table2A, res)
+}
+
+
+
+## Age-adjusted glmer
+
+varnames <- c( "areaunt2_nepal", "sex", "income2", "watersource", "hftreatdkwater")
+
+
+table2B <- data.frame()  
+
+for (i in varnames){
+  #number of levels of i
+  nlevels_i <- nlevels(d0_bs[[i]])
+  
+  # fit the model
+  formula    <- as.formula(paste0( "hev_pos ~ ", i , " + age + (1|areaunt2_nepal)"))
+  fit <- glmer(formula, data = d0_bs, family = binomial(link="logit"))
+
+  # Tabulate results
+  res <- as.data.frame(emmeans(fit, i, type="response")) %>%
+    mutate(Est = paste(sprintf('%.1f', prob*100), "% (",  sprintf('%.1f', asymp.LCL*100), "-", sprintf('%.1f', asymp.UCL*100), ")", sep="")) %>%
+    mutate(variable = i) %>%
+    rename(levels = i) %>%
+    select(variable, levels, Est) %>%
+    mutate(Pval = sprintf('%.3f', summary(fit)$coefficients[1:nlevels_i,4]))
+  
+  res[1,4] <- "Ref"
+  
+  # group d0_bs by i and calculate n, nPos, and prevalence
+  summary_info <- d0_bs %>%
+    group_by_at(vars(i)) %>%
+    summarise(n = n(),
+              nPos = sum(hev_pos),
+              prevalence = paste0(sprintf('%.1f', (nPos / n)*100), "%")) %>% 
+  na.omit()
+  
+  # add summary information to res table
+  res$n <- summary_info$n
+  res$nPos <- summary_info$nPos
+  res$crudPrev <- summary_info$prevalence
+  
+  table2B <- rbind(table2B, res)
+}
+
+
+Table2 <- rbind(overall, table2A, table2B) %>%
+  mutate(Pval=as.character(Pval),
+         Pval = ifelse(Pval=="0.000", "<0.001", Pval)) %>%
+  select(levels, n, nPos, crudPrev, Est, Pval) %>%
+  rename("N()" = n,
+         "N seropositive" = nPos,
+         "Crude seroprevalence" = crudPrev,
+         "Modeled seroprevalence (95% CI)" = Est,
+         "p value" = Pval)
+
+
+label(d0_bs$age) <- "Age, in years"
+label(d0_bs$sex) <- "Gender"
+label(d0_bs$hf_famincome_nepal) <- "Household monthly income, Nepalese rupees"
+label(d0_bs$watersource) <- "Primary water source"
+label(d0_bs$education) <- "Current level of education"
+label(d0_bs$nvisits) <- "Number of study visits"
+
+
+
+kable(Table2, align = rep("c", ncol(Table2))) %>%
+  kable_styling(full_width = T) %>%
+  pack_rows("Age, categorical", 2, 5) %>%
+  pack_rows("City/town*", 6, 10) %>%
+  pack_rows("Gender*", 11,12) %>%
+  pack_rows("Household monthly income, Nepalese rupees*", 13, 14) %>%
+  pack_rows("Primary water source*", 15, 19) %>%
+  pack_rows("Household treats drinking water*", 20, 21) %>%
+  footnote(general = "*Mixed effect models adjusted for age with a random effect for city/town")
+
+
+
+
+```
+
+
+
+## Figure 3: Age-dependent Seroprevalence
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+####Reference: Arnold, Benjamin F., et al. "Enteropathogen antibody dynamics and force of infection among children in low-resource settings." Elife 8 (2019): e45594.
+##gam fits
+gamCI <- function(m,newdata,nreps=10000) {
+  require(mgcv)
+  require(dplyr)
+  Vb <- vcov(m,unconditional = TRUE)
+  pred <- predict(m, newdata, se.fit = TRUE)
+  fit <- pred$fit
+  se.fit <- pred$se.fit
+  #se.fit <- pred$se.fit
+  BUdiff <- MASS::mvrnorm(n=nreps, mu = rep(0, nrow(Vb)), Sigma = Vb)
+  Cg <- predict(m, newdata, type = "lpmatrix")
+  simDev <- Cg %*% t(BUdiff)
+  absDev <- abs(sweep(simDev, 1, se.fit, FUN = "/"))
+  masd <- apply(absDev, 2L, max)
+  crit <- quantile(masd, prob = 0.95, type = 8)
+  pred <- data.frame(newdata,fit=pred$fit,se.fit=pred$se.fit)
+  pred <- mutate(pred,
+                 uprP = fit + (2 * se.fit),
+                 lwrP = fit - (2 * se.fit),
+                 uprS = fit + (crit * se.fit),
+                 lwrS = fit - (crit * se.fit)
+  )
+  return(pred)
+}
+
+    pd <- d0 %>%
+      filter(TimePeriod == "Baseline") 
+    gfit <- gam(hev_pos~s(calculated_age_todate, bs="cr", k=2),data=pd,family="binomial")
+    gsci <- gamCI(m=gfit,newdata=pd,nreps=1000)
+
+gamfits1 <- gsci %>%
+            mutate(fit = 1/(1+exp(-fit)),
+                    uprP = 1/(1+exp(-uprP)),
+                    lwrP = 1/(1+exp(-lwrP)),
+                    uprS = 1/(1+exp(-uprS)),
+                    lwrS = 1/(1+exp(-lwrS)))
+    
+
+p <- ggplot(gamfits1, aes(x=calculated_age_todate)) + 
+  geom_point(aes(y=hev_pos, color=as.factor(hev_pos_lab)), size = .5, alpha = .5) +
+  geom_ribbon(aes(ymin=lwrS,ymax=uprS),alpha=0.3, fill="#d1495b")  +
+  geom_line(aes(y=fit), size=1, color = "#d1495b") + 
+  scale_x_continuous(breaks = seq(0, 25, by = 5), minor_breaks = NULL) + 
+  scale_y_continuous(limits = c(0,1), expand = c(0.01,0.01), breaks = seq(0,1, by = .1), minor_breaks = NULL, labels = scales::percent) +
+  theme_bw() + 
+  scale_color_manual(values = pal.pos, name = "") +
+  labs(y = "Seroprevalence", x = "Age in years", color = "Seropositive")
+
+# Add marginal histograms
+p_marginal <- ggMarginal(p, type = "histogram", margins = "x", size = 5, groupColour = TRUE, groupFill = TRUE)
+
+# Print the plot with marginal histograms
+print(p_marginal)
+
+
+```
+
+
+
+## Table 3: HEV Seroincidence
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+
+####INCIDENT SEROCONVERSIONS ###################
+##Reference: Arnold, Benjamin F., et al. "Enteropathogen antibody dynamics and force of infection among children in low-resource settings." Elife 8 (2019): e45594.
+
+#-----------------------------
+# identify incident 
+# seroconversions and reversions
+#-----------------------------
+
+# group the data by child and
+# use lags to identify
+# time in days between measurements,
+# sero-conversions + sero-reversions 
+# between measurements
+# set the first measurement to 
+# missing for the incidence indicators
+
+di <- d0 %>%
+  select(index_id, dbsdate, areaunt2_nepal, income2, watersource, hftreatdkwater, ageCat, sex, TimePeriod, age, hev_pos) %>%
+  group_by(index_id) %>% 
+  fill(age, sex, areaunt2_nepal, income2, watersource, hftreatdkwater, ageCat) %>%
+  arrange(index_id,TimePeriod) %>%
+  mutate(date_min  = min(dbsdate),
+         dt_diff = dbsdate - lag(dbsdate),
+         dt_diff = if_else(dbsdate == date_min, as.difftime(0, units = "days"), dt_diff), # replace NA with 0 days when dbsdate equals date_min
+         
+         # incident seroconversions and reversions
+         # including cumulative numbers
+         # based on crossing seropositivity cutoff
+         seropos_lag  = lag(hev_pos),
+         seroi = ifelse(hev_pos==1 & seropos_lag==0,1,0),
+         seroin = cumsum(ifelse(is.na(seroi),0,seroi)),
+         seroin = ifelse(seroi==1,seroin,0),
+         seror = ifelse(hev_pos==0 & seropos_lag==1,1,0),
+         serorn = cumsum(ifelse(is.na(seror),0,seror)),
+         serorn = ifelse(seror==1,serorn,0)
+  ) %>%
+  ungroup() %>%
+  mutate(pt_years = as.numeric(dt_diff/365.25)) %>%
+  mutate(pt_days = as.numeric(dt_diff)) %>%
+  mutate(visitN = as.numeric(TimePeriod)) %>%
+  droplevels()
+
+
+
+
+#-----------------------------
+# estimate sero-incidence rates
+# for conversion and reversion
+# estimate SEs with a bootstrap
+#-----------------------------
+
+#-----------------------------
+# estimate time at risk
+# for seroconversion and reversion
+# assumed to be 1/2 of time
+# between measurements
+# if indivs are seropositive
+# at measurement 1 they are
+# not at risk for seroconversion
+# (and vice-versa for seroreversion)
+#-----------------------------
+di2 <- di %>%
+  mutate(ptc = ifelse(hev_pos==0,dt_diff,0),
+         ptc = ifelse(hev_pos==1 & seroi==1,dt_diff/2, ptc),
+         ptr = ifelse(hev_pos==1 & seror==0, dt_diff,0),
+         ptr = ifelse(hev_pos==0 & seror==1,dt_diff/2,ptr))
+
+
+test <- di2 %>% select(index_id, dbsdate, hev_pos, seroi, seror, dt_diff, ptc, ptr)
+
+# Function to calculate incidence rates and their Poisson confidence intervals
+rate_calc <- function(data){
+  
+  # Calculate the statistics for the original data
+  ni <- sum(data$seroi, na.rm = TRUE) #incident cases
+  nit <- round(sum(data$ptc, na.rm = TRUE) / 365, 1) #person time - conversions
+  seroi <- ni / nit * 1000 #seroincidence
+  ci_seroi <- poisson.test(ni, T = nit)$conf.int * 1000 # Poisson CI for seroincidence
+  
+  nr <- sum(data$seror, na.rm = TRUE) # incident seroreversions
+  nrt <- sum(data$ptr, na.rm = TRUE) /365 #person time  - reversions
+  seror <- nr / nrt *1000 #sero-reversion rate
+  ci_seror <- poisson.test(nr, T = nrt)$conf.int * 1000 # Poisson CI for sero-reversion rate
+  
+  # Create a data frame to hold the results
+  results <- data.frame(incident_cases = ni, person_years = nit,
+                        seroi = seroi, ci_seroi_low = ci_seroi[1], ci_seroi_high = ci_seroi[2],
+                       reversion_cases = nr, person_time_reversions = nrt,
+                         seror = seror, ci_seror_low = ci_seror[1], ci_seror_high = ci_seror[2])
+  
+  return(results)
+}
+
+
+
+# Apply the function to each group 
+
+t2.all <- di2 %>%
+  do(rate_calc(.)) %>%
+  mutate(var = "Overall")
+
+
+t2.sex <- di2 %>%
+  group_by(sex) %>%
+  do(rate_calc(.)) %>%
+  filter(!is.na(sex)) %>%
+  rename(var = sex) 
+
+
+t2.age <- di2 %>%
+  group_by(ageCat) %>%
+  do(rate_calc(.)) %>%
+  rename(var = ageCat) 
+
+t2.area <- di2 %>%
+  group_by(areaunt2_nepal) %>%
+  do(rate_calc(.)) %>%
+  rename(var = areaunt2_nepal) 
+
+
+t2.water <- di2 %>%
+  group_by(watersource) %>%
+  do(rate_calc(.)) %>%
+  rename(var = watersource) 
+
+ 
+
+t2.water2 <- di2 %>%
+  group_by(hftreatdkwater) %>%
+  do(rate_calc(.)) %>%
+  rename(var = hftreatdkwater) 
+
+t2.income <- di2 %>%
+  group_by(income2) %>%
+  do(rate_calc(.)) %>%
+  rename(var = income2) 
+
+
+
+
+
+t2.comb <- rbind(t2.all,  t2.age, t2.area, t2.sex, t2.income, t2.water, t2.water2) %>%
+  mutate(seroincidence = paste0(sprintf("%.1f", seroi), " (", sprintf("%.1f", ci_seroi_low),"-", sprintf("%.1f",ci_seroi_high), ")")) %>%
+  select(var, incident_cases, person_years, seroincidence) %>%
+  filter(!is.na(var))
+
+
+######POISSON MODEL/NEGATIVE BINOMIAL
+
+#overall
+
+# fit3A <- glmer(hev_pos ~  (1 | index_id),
+#               data = di,
+#               family = poisson,
+#               offset = pt_days + 1)
+
+di.dropna <- di %>% select(index_id, seroi, pt_years) %>% drop_na() %>% mutate(pt_years = ifelse(pt_years<=0, 0.01, pt_years)) %>% mutate(mean = 1)
+
+
+fit3A <- glmer.nb(seroi ~ mean +  (1 | index_id), 
+                  data = di.dropna, 
+                  offset = log(di.dropna$pt_years))
+
+
+table3A <- as.data.frame(emmeans(fit3A, specs = "1", type = "response", data=di.dropna)) %>%
+  mutate(Est = paste(sprintf('%.1f', response*1000), " (",  sprintf('%.1f', asymp.LCL*1000),
+                     "-", sprintf('%.1f', asymp.UCL*1000), ")", sep="")) %>%
+  mutate(variable = "Overall",
+         levels = NA) %>%
+  select(variable, levels, Est) %>%
+  mutate(Pval = "-")
+
+
+
+
+#negative binomial
+  fit3B <- glmer.nb(seroi ~ ageCat + (1|index_id), data = di, offset = log(di$pt_years + 0.01))
+
+  
+  # Tabulate results using emmeans
+  table3B <- as.data.frame(emmeans(fit3B, specs = "ageCat", type = "response")) %>%
+    mutate(Est = paste(sprintf('%.2f', response*1000), " (",  sprintf('%.2f', asymp.LCL*1000), "-", sprintf('%.2f', asymp.UCL*1000), ")", sep="")) %>%
+    mutate(variable = ageCat) %>%
+    rename(levels = ageCat) %>%
+    select(variable, levels, Est) %>%
+    mutate(Pval = sprintf('%.3f', summary(fit3B)$coefficients[,4]))
+  
+  table3B[1,4] <- "-"
+  
+
+
+
+varnames <- c("areaunt2_nepal", "sex", "income2", "watersource", "hftreatdkwater")
+
+table3C <- data.frame()  
+
+
+
+results_list <- foreach(i = varnames, .combine = rbind, .packages = c("lme4", "emmeans")) %dopar% {
+  
+  # number of levels of i
+  nlevels_i <- nlevels(di[[i]])
+  
+  # fit the model
+  formula <- as.formula(paste0("seroi ~ ", i, " + age +  (1|index_id) + (1|areaunt2_nepal)"))
+  #fit <- glmer(formula, data = di, family = poisson, offset = log(di$pt_years + 0.01))
+  fit <- glmer.nb(formula, data = di, offset = log(di$pt_years + 0.01))
+  
+  # Tabulate results using emmeans
+  res <- as.data.frame(emmeans(fit, specs = i, type = "response")) %>%
+    mutate(Est = paste(sprintf('%.1f', response*1000), " (",  sprintf('%.1f', asymp.LCL*1000), "-", sprintf('%.1f', asymp.UCL*1000), ")", sep="")) %>%
+    mutate(variable = i) %>%
+    rename(levels = i) %>%
+    select(variable, levels, Est) %>%
+    mutate(Pval = sprintf('%.3f', summary(fit)$coefficients[1:nlevels_i, 4]))
+  
+  res[1,4] <- "Ref"
+  
+  return(res)
+}
+
+
+table3C <- as.data.frame(results_list)
+
+
+table3 <- rbind(table3A, table3B, table3C)
+
+
+###################
+fit <- glmer.nb(seroi ~ hftreatdkwater + age +  (1|index_id), data = di, offset = log(di$pt_years + 0.01))
+#fit <- glmer(seroi ~ hftreatdkwater + age +  (1|index_id), data = di, family = poisson, offset = log(di$pt_years + 0.01))
+
+
+t3.comb <- cbind(t2.comb, table3) %>%
+  select(-variable, - levels) %>%
+  mutate(Est = ifelse((Est == "0.0 (0.0-Inf)" | Est == "0.0 (0.0-41.4)" | Est == "0.0 (0.0-32.0)"), "-", Est)) %>%
+  mutate(Pval = ifelse(Pval == 1.0, "-", Pval)) %>%
+  mutate(Pval = ifelse(var == "5-<10", "Ref", Pval))
+
+kable(t3.comb, align = rep("c", ncol(t3.comb)),
+                                     col.names = c("", "Incident seroconversions", "Person-years",
+                                                   "Seroconversions/person-time", "Modeled seroincidence*", "p-value*")) %>%
+add_header_above(c(" " = 3, "Seroincidence rate per 1000 person-years" = 3)) %>%
+  kable_styling(full_width = T) %>%
+  pack_rows("Age, categorical", 2, 5) %>%
+  pack_rows("City/town*", 6, 10) %>%
+  pack_rows("Gender*", 11, 12) %>%
+  pack_rows("Household monthly income, Nepalese rupees*", 13, 14) %>%
+  pack_rows("Primary water source*", 15, 19) %>%
+ pack_rows("Household treats drinking water*", 20, 21) %>%
+  footnote(general = "*Mixed effect poisson model adjusted for age and repeated measures")
+
+
+dp <- di %>% filter(areaunt2_nepal=="Panauti")
+table(dp$seroi, dp$watersource)
+
+
+
+```
+
+
+## Figure 3: HEV Seroprevalence at baseline and prospective seroconversions across the enrollment areas (Banepa, Panauti, Dhulikhel, Panchkhal: Kavre and Kathmandu) and over the enrollment period of Feb 2019 to Apr 2021.
+
+#   Maps moved to map .R file
+
+
+
+
+## Supplemental Table 1: Sensitivity analysis of seroprevalence and seroincidence rate to different cutoff values
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+
+# Define the column names
+names <- c("Cutoff", "N seropositive", "Total N", "Seroprevalence", "Incident Cases", "Person-years", "Seroincidence rate per 1000 PYs")
+
+# Create vectors for each row
+cut2 <- c("+2 SD", 97, 923, "10.5%", 61, 800.2, 76.23)
+cut3 <- c("+3 SD", 53, 923, "5.7%", 15, 817.2, 18.34)
+cut4 <- c("+4 SD", 38, 923, "4.1%", 4, 825.3, 4.84)
+
+# Combine vectors into a matrix and then convert to a data frame
+data_matrix <- rbind(cut2, cut3, cut4)
+data <- as.data.frame(data_matrix, stringsAsFactors = FALSE, row.names = F)
+
+# Set the column names
+colnames(data) <- names
+
+# Print the data frame
+
+kable(data) %>%
+   kable_styling(full_width = T) %>%
+  add_header_above(c(" " = 1, "Baseline" = 3, "Overall" = 3)) 
+
+```
+
+
+## Supplemental Table 2: Seroreversions by age category
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+
+a <- t2.all %>% mutate(var = "Overall")
+
+s2a <- rbind(a, t2.age) %>%
+  mutate(Est = paste(sprintf('%.1f', seror), " (",  sprintf('%.1f', ci_seror_low), "-", sprintf('%.1f', ci_seror_high), ")", sep="")) %>%
+    select(var, reversion_cases, person_time_reversions, Est) %>%
+  mutate(person_time_reversions = round(person_time_reversions, 2))
+
+
+kable(s2a, align = rep("c", ncol(s2a)),
+                                     col.names = c("", "Seroreversions", "Person-years",
+                                                   "Seroreversion rate per 1000 person-years")) %>%
+  kable_styling(full_width = T) %>%
+  pack_rows("Overall", 1, 1) %>%
+  pack_rows("Age, categorical", 2, 4)
+
+
+```
+
+
+
+## Supplemental Table 3: Seroincidence derived from the age-dependent seroprevalence
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+
+d0_f_m <- d0_f %>% filter(sex == "Male")
+d0_f_f <- d0_f %>% filter(sex == "Female")
+
+
+
+##overall
+glmfoi <- function (d) {
+    pd <- d  %>%
+      droplevels()
+
+    gfit <- glm(hev_pos~1,offset=log(age),data=pd,family=binomial(link="cloglog"))
+    gsum <- summary(gfit)
+    lambda <- as.numeric(exp(gfit$coefficients))
+    log_lambda_se  <- sqrt(gsum$cov.unscaled)
+    lambda_lb <- as.numeric(exp(gfit$coefficients - 1.96*log_lambda_se))
+    lambda_ub <- as.numeric(exp(gfit$coefficients + 1.96*log_lambda_se))
+    di <- data.frame(lambda,lambda_lb,lambda_ub)
+    return(di)
+}
+
+t1 <- glmfoi(d0_f) %>% mutate(var = "Overall")
+t1.m <- glmfoi(d0_f_m) %>% mutate(var = "Male")
+t1.f <- glmfoi(d0_f_f) %>% mutate(var = "Female")
+
+
+## Age specific
+glmfoi.age <- function (d, cat) {
+    pd <- d  %>% droplevels() %>% filter(ageCat == cat)
+    gfit <- glm(hev_pos~1,offset=log(age),data=pd,family=binomial(link="cloglog"))
+    gsum <- summary(gfit)
+    lambda <- as.numeric(exp(gfit$coefficients))
+    log_lambda_se  <- sqrt(gsum$cov.unscaled)
+    lambda_lb <- as.numeric(exp(gfit$coefficients - 1.96*log_lambda_se))
+    lambda_ub <- as.numeric(exp(gfit$coefficients + 1.96*log_lambda_se))
+    di <- data.frame(var = cat, lambda,lambda_lb,lambda_ub)
+    return(di)
+}
+
+
+t2 <- foreach(cat=levels(d0_f$ageCat), .combine = rbind) %do% {
+  glmfoi.age(d0_bs,  cat)
+}
+
+
+
+
+
+
+glmfoi.unit <- function (d, unt) {
+    pd <- d  %>%
+     filter(areaunt2_nepal == unt) %>%
+      droplevels()
+
+    gfit <- glm(hev_pos~1,offset=log(age),data=pd,family=binomial(link="cloglog"))
+    gsum <- summary(gfit)
+    lambda <- as.numeric(exp(gfit$coefficients))
+    log_lambda_se  <- sqrt(gsum$cov.unscaled)
+    lambda_lb <- as.numeric(exp(gfit$coefficients - 1.96*log_lambda_se))
+    lambda_ub <- as.numeric(exp(gfit$coefficients + 1.96*log_lambda_se))
+    di <- data.frame(var = unt, lambda,lambda_lb,lambda_ub)
+    return(di)
+}
+
+
+t3 <- foreach(unt = levels(d0_f$areaunt2_nepal), .combine = rbind) %do% {
+  glmfoi.unit(d0_bs,unt)
+}
+
+
+comb.SI.exp <- rbind(t1, t1.f, t1.m,  t2, t3) %>%
+  #filter(lambda_ub != "Inf") %>%
+  mutate(seroincidence.exp = paste(sprintf("%.1f", lambda*1000), " (", sprintf("%.1f", lambda_lb*1000), "-", 
+                                   sprintf("%.1f",lambda_ub*1000), ")", sep = "")) %>%
+  select(var, seroincidence.exp) %>%
+  rename(var2 = var)
+
+
+
+kable(comb.SI.exp, align = rep("c", ncol(comb.SI.exp)),
+                                     col.names = c("", "Seroincidence rate per 1000 person-years")) %>%
+  kable_styling(full_width = T) %>%
+    pack_rows("Gender", 2, 3) %>%
+  pack_rows("Age, categorical", 4, 7) %>%
+  pack_rows("City/town*", 8, 12) 
+
+```
